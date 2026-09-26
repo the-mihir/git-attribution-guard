@@ -8,7 +8,7 @@ Only the latest release receives fixes.
 
 Please **do not** open a public issue. Use GitHub's private reporting:
 **Security > Report a vulnerability** on
-https://github.com/OWNER/git-attribution-guard/security/advisories/new
+https://github.com/the-mihir/git-attribution-guard/security/advisories/new
 
 Include the version (`attribution version`), your OS/shell, and steps to
 reproduce. You should get an answer within 7 days. Fixes are released as a

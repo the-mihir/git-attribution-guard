@@ -5,7 +5,7 @@ Thanks for helping. Small, focused pull requests are easiest to review.
 ## Setup
 
 ```sh
-git clone https://github.com/OWNER/git-attribution-guard.git
+git clone https://github.com/the-mihir/git-attribution-guard.git
 cd git-attribution-guard
 make check            # needs shellcheck; git-filter-repo enables the rewrite tests
 ```

@@ -3,8 +3,8 @@
 ## 1. First publish to GitHub (one time)
 
 ```sh
-# Replace the OWNER placeholder with your GitHub user or organisation.
-grep -rl OWNER --exclude-dir=.git . | xargs sed -i.bak 's/OWNER/your-github-name/g'
+# Replace the the-mihir placeholder with your GitHub user or organisation.
+grep -rl the-mihir --exclude-dir=.git . | xargs sed -i.bak 's/the-mihir/your-github-name/g'
 find . -name '*.bak' -not -path './.git/*' -delete
 
 make check                     # lint + tests must pass

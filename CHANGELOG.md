@@ -24,5 +24,5 @@ project uses [Semantic Versioning](https://semver.org/).
   mailmap support, `origin` remote preserved.
 - CI check example for enforcing attribution on pull requests.
 
-[Unreleased]: https://github.com/OWNER/git-attribution-guard/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/OWNER/git-attribution-guard/releases/tag/v1.0.0
+[Unreleased]: https://github.com/the-mihir/git-attribution-guard/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/the-mihir/git-attribution-guard/releases/tag/v1.0.0

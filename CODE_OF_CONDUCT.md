@@ -6,7 +6,7 @@ In short: be respectful, assume good intent, and keep discussions about the work
 Harassment of any kind is not tolerated.
 
 Report unacceptable behaviour privately to the maintainer through
-https://github.com/OWNER/git-attribution-guard/security/advisories/new
+https://github.com/the-mihir/git-attribution-guard/security/advisories/new
 (choose "Report a vulnerability" and mark it as a conduct report) or by
 contacting the maintainer listed on the GitHub profile. Reports are handled
 confidentially.

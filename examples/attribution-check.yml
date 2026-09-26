@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 5
     env:
       GAG_VERSION: v1.0.0            # pin a release; bump deliberately
-      GAG_REPO: OWNER/git-attribution-guard
+      GAG_REPO: the-mihir/git-attribution-guard
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:

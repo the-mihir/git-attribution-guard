@@ -1,7 +1,7 @@
 # git-attribution-guard
 
-[![CI](https://github.com/OWNER/git-attribution-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/git-attribution-guard/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/OWNER/git-attribution-guard)](https://github.com/OWNER/git-attribution-guard/releases)
+[![CI](https://github.com/the-mihir/git-attribution-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/the-mihir/git-attribution-guard/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/the-mihir/git-attribution-guard)](https://github.com/the-mihir/git-attribution-guard/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 You decide who appears as author, co-author and contributor on your commits and on GitHub.
@@ -31,8 +31,8 @@ From a release (recommended; checksum verified):
 
 ```sh
 v=1.0.0
-curl -fsSLO https://github.com/OWNER/git-attribution-guard/releases/download/v$v/git-attribution-guard-$v.tar.gz
-curl -fsSLO https://github.com/OWNER/git-attribution-guard/releases/download/v$v/SHA256SUMS
+curl -fsSLO https://github.com/the-mihir/git-attribution-guard/releases/download/v$v/git-attribution-guard-$v.tar.gz
+curl -fsSLO https://github.com/the-mihir/git-attribution-guard/releases/download/v$v/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS   # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS
 tar xzf git-attribution-guard-$v.tar.gz
 sh git-attribution-guard-$v/install.sh
@@ -41,7 +41,7 @@ sh git-attribution-guard-$v/install.sh
 From a clone:
 
 ```sh
-git clone https://github.com/OWNER/git-attribution-guard.git
+git clone https://github.com/the-mihir/git-attribution-guard.git
 cd git-attribution-guard
 ./install.sh                 # global: all your repositories
 ```
