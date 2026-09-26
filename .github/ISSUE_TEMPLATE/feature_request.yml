@@ -1,0 +1,16 @@
+name: Feature request
+description: Suggest an idea or a new AI/bot pattern
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: For a new AI tool, paste an exact example trailer or author line.

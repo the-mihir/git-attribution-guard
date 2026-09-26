@@ -1,0 +1,5 @@
+# Shared ShellCheck settings (CI runs: make lint)
+shell=sh
+external-sources=true
+# Single-quoted awk / python programs and literal `$` text are intentional.
+disable=SC2016

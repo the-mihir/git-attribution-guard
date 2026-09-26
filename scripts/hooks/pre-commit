@@ -1,0 +1,10 @@
+#!/bin/sh
+# git-attribution-guard hook. Managed file: changes are overwritten on install.
+GAG_ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P) || exit 1
+if [ ! -f "$GAG_ROOT/core.sh" ]; then
+  echo "git-attribution-guard: $GAG_ROOT/core.sh is missing. Reinstall, or run: attribution uninstall" >&2
+  exit 1
+fi
+# shellcheck source=scripts/core.sh
+. "$GAG_ROOT/core.sh"
+gag_hook_main pre-commit 1 "$@"

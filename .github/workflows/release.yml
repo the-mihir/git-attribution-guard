@@ -1,0 +1,70 @@
+name: Release
+
+# Push a tag like v1.2.3 (or v1.2.3-rc.1 for a pre-release) to publish.
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  release:
+    name: Publish GitHub Release
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # create the release and upload assets; nothing else
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check tag, VERSION and CHANGELOG agree
+        run: make version-check TAG="$GITHUB_REF_NAME"
+
+      - name: Build archives and checksums
+        run: make dist
+
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          awk -v v="$v" '
+            $0 ~ "^## \\[" v "\\]" { on = 1; next }
+            on && /^## \[/ { exit }
+            on && /^\[.*\]: / { exit }
+            on { print }
+          ' CHANGELOG.md > dist/NOTES.md
+          {
+            echo
+            echo "### Verify the download"
+            echo '```sh'
+            echo "sha256sum --check --ignore-missing SHA256SUMS   # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS"
+            echo '```'
+          } >> dist/NOTES.md
+          cat dist/NOTES.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          pre=""
+          case "$TAG" in *-*) pre="--prerelease" ;; esac
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "git-attribution-guard $TAG" \
+            --notes-file dist/NOTES.md \
+            $pre \
+            dist/*.tar.gz dist/*.zip dist/SHA256SUMS

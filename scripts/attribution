@@ -1,0 +1,941 @@
+#!/bin/sh
+# attribution - control who appears as author / co-author on your git commits.
+# Part of git-attribution-guard. POSIX sh. No network access, no telemetry.
+# SPDX-License-Identifier: MIT
+
+set -u
+
+# Resolve our real location (follows symlinks without GNU readlink -f).
+_self=$0
+while [ -L "$_self" ]; do
+  _link=$(readlink "$_self")
+  case $_link in /*) _self=$_link ;; *) _self=$(dirname -- "$_self")/$_link ;; esac
+done
+GAG_ROOT=$(CDPATH='' cd -- "$(dirname -- "$_self")" && pwd -P) || exit 1
+# shellcheck source=scripts/core.sh
+. "$GAG_ROOT/core.sh"
+
+if [ -f "$GAG_ROOT/VERSION" ]; then GAG_VERSION=$(cat "$GAG_ROOT/VERSION")
+elif [ -f "$GAG_ROOT/../VERSION" ]; then GAG_VERSION=$(cat "$GAG_ROOT/../VERSION")
+else GAG_VERSION=unknown; fi
+
+GAG_STATE_GLOBAL="${XDG_STATE_HOME:-$HOME/.local/state}/git-attribution-guard"
+GAG_CLAUDE_GLOBAL="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+
+# ------------------------------------------------------------------ help ---
+
+usage() {
+  cat <<EOF
+attribution $GAG_VERSION - control commit authors and co-authors (git-attribution-guard)
+
+Usage: attribution <command> [options]
+
+Setup
+  install   [--global|--local] [--agent-instructions]   enable hooks + Claude Code settings
+  uninstall [--global|--local]                           undo exactly what install did
+  status                                                 effective settings and where they come from
+  doctor                                                 diagnose hook conflicts and setup problems
+
+Settings (global by default, --local = current repository only)
+  on | off                     [--global|--local]
+  mode <strip-ai|allowlist|strip-all|off> [--global|--local]
+  allow add|remove <email>     [--global|--local]   ("@example.com" allows a whole domain)
+  allow list
+  author set "<Name>" <email>  [--global|--local]
+  author clear                 [--global|--local]
+
+History
+  check   [<revision-range>]                             read-only report (exit 1 if findings)
+  rewrite [<revision-range>] [--dry-run] [--remove-ai] [--mailmap <file>]
+
+Other
+  version | help | <command> --help
+
+Docs: README.md in the install directory ($GAG_ROOT).
+EOF
+}
+
+cmd_help() {
+  case ${1:-} in
+    install) cat <<'EOF'
+Usage: attribution install [--global|--local] [--agent-instructions]
+
+--global (default)  Set global core.hooksPath to the guard's hooks. An existing
+                    global hooksPath is remembered and chained, and each
+                    repository's own .git/hooks keep running.
+                    Turns off Claude Code attribution in ~/.claude/settings.json.
+--local             Current repository only. If the repository has its own
+                    core.hooksPath (Husky, custom dir) a guarded call is added
+                    to those hooks instead of replacing them.
+                    Turns off Claude Code attribution in .claude/settings.json.
+--agent-instructions  Also add a short "no AI co-authors" section to
+                    CLAUDE.md / AGENTS.md. Hooks stay the real guarantee.
+Running install twice changes nothing. Every modified file is backed up first.
+EOF
+    ;;
+    uninstall) echo 'Usage: attribution uninstall [--global|--local]
+Removes only what install added and restores remembered settings. Your
+attribution.* preferences stay (remove with: git config --global --remove-section attribution).' ;;
+    mode) cat <<'EOF'
+Usage: attribution mode <mode> [--global|--local]
+
+strip-ai   (default) remove AI/bot co-author trailers and "Generated with" lines
+allowlist  remove every Co-authored-by trailer except allowed emails
+strip-all  remove every Co-authored-by trailer
+off        do nothing
+EOF
+    ;;
+    allow) echo 'Usage: attribution allow add|remove <email> [--global|--local] | attribution allow list
+Allowed emails are kept in every mode except strip-all, and override AI detection.
+Global and local lists are combined.' ;;
+    author) echo 'Usage: attribution author set "<Name>" <email> [--global|--local] | attribution author clear [--global|--local]
+When set, commits whose author does not match are blocked by the pre-commit hook.' ;;
+    check) echo 'Usage: attribution check [<revision-range>]
+Read-only. Lists commits with AI/bot authors or disallowed co-author lines.
+Default range: all commits reachable from HEAD. Exit code 1 when something is found.' ;;
+    rewrite) cat <<'EOF'
+Usage: attribution rewrite [<revision-range>] [--dry-run] [--remove-ai] [--mailmap <file>]
+
+Rewrites PAST commits with git filter-repo. Never automatic.
+  --dry-run      show what would change, change nothing (always run this first)
+  --remove-ai    remove disallowed co-author / "Generated with" lines (default
+                 when --mailmap is not given)
+  --mailmap F    fix author / committer names and emails with a mailmap file
+Default range: the current branch. Requires a clean working tree. Creates backup
+refs under refs/attribution-backup/<timestamp>/ and asks for typed confirmation.
+EOF
+    ;;
+    on|off) echo 'Usage: attribution on|off [--global|--local]' ;;
+    status|doctor|version) echo "Usage: attribution $1" ;;
+    *) usage ;;
+  esac
+}
+
+# --------------------------------------------------------------- helpers ---
+
+need_repo() {
+  git rev-parse --git-dir >/dev/null 2>&1 || gag_die "not inside a git repository"
+}
+
+# Sets SCOPE from --global / --local; returns 1 when the arg is not a scope flag.
+SCOPE=global
+scope_flag() {
+  case $1 in
+    --global) SCOPE=global ;;
+    --local) SCOPE=local ;;
+    *) return 1 ;;
+  esac
+}
+
+cfg_set() {
+  [ "$SCOPE" = global ] || need_repo
+  git config "--$SCOPE" "$@"
+}
+
+# Where does a key's value come from? prints local|global|system|default.
+scope_of() {
+  for _s in local global system; do
+    if git config "--$_s" --get-all "$1" >/dev/null 2>&1; then printf '%s' "$_s"; return; fi
+  done
+  printf 'default'
+}
+
+regex_escape() { printf '%s' "$1" | sed 's/[][\.*^$+?(){}|/]/\\&/g'; }
+
+timestamp() { date +%Y%m%d-%H%M%S; }
+
+hooks_dir_canon() { gag_canon "$GAG_HOOKS_DIR"; }
+
+# Make sure every hook we manage (plus pass-through stubs) exists and is executable.
+ensure_hook_files() {
+  [ -f "$GAG_HOOKS_DIR/_passthrough" ] || gag_die "missing $GAG_HOOKS_DIR/_passthrough; reinstall"
+  for _h in $GAG_PASSTHROUGH_HOOKS; do
+    [ -f "$GAG_HOOKS_DIR/$_h" ] || cp "$GAG_HOOKS_DIR/_passthrough" "$GAG_HOOKS_DIR/$_h"
+  done
+  for _h in $GAG_MANAGED_HOOKS $GAG_PASSTHROUGH_HOOKS; do
+    [ -x "$GAG_HOOKS_DIR/$_h" ] || chmod 755 "$GAG_HOOKS_DIR/$_h"
+  done
+}
+
+# Copy a file to <file>.bak-<timestamp> (keeps mode). Prints the backup path.
+backup_file() {
+  _b="$1.bak-$(timestamp)"
+  cp -p "$1" "$_b" || gag_die "cannot back up $1"
+  printf '%s' "$_b"
+}
+
+# Atomic-ish replace: write $2 (temp) over $1 keeping $1's mode.
+replace_file() {
+  _dst=$1; _src=$2; _t="$_dst.gag-tmp.$$"
+  if [ -f "$_dst" ]; then cp -p "$_dst" "$_t" || return 1; else : > "$_t" || return 1; fi
+  if cat "$_src" > "$_t" && mv -f "$_t" "$_dst"; then return 0; fi
+  rm -f "$_t"; return 1
+}
+
+# Remove a marked block (begin/end lines, inclusive) from a file. 0 = removed.
+remove_block() {
+  _f=$1; _b=$2; _e=$3
+  [ -f "$_f" ] && grep -qF "$_b" "$_f" || return 1
+  _t=$(gag_tmp)
+  awk -v b="$_b" -v e="$_e" '$0 == b { skip = 1; next } skip && $0 == e { skip = 0; next } !skip' "$_f" > "$_t"
+  replace_file "$_f" "$_t"; rm -f "$_t"
+}
+
+# ------------------------------------------------------------ JSON merge ---
+# gag_json <status|orig|apply|revert> <settings.json> [state.json]
+# status: exit 0 when attribution is already off. Others print JSON to stdout.
+
+JSON_PY='
+import json, os, sys
+act, path = sys.argv[1], sys.argv[2]
+state = sys.argv[3] if len(sys.argv) > 3 else ""
+text = open(path, encoding="utf-8").read() if os.path.exists(path) else ""
+d = json.loads(text) if text.strip() else {}
+if not isinstance(d, dict): sys.exit(2)
+def ours(d):
+    a = d.get("attribution")
+    return isinstance(a, dict) and a.get("commit") == "" and a.get("pr") == "" and d.get("includeCoAuthoredBy") is False
+if act == "status": sys.exit(0 if ours(d) else 1)
+if act == "orig":
+    print(json.dumps({"has_a": "attribution" in d, "a": d.get("attribution"), "has_i": "includeCoAuthoredBy" in d, "i": d.get("includeCoAuthoredBy")})); sys.exit(0)
+if act == "apply":
+    a = d.get("attribution"); a = dict(a) if isinstance(a, dict) else {}
+    a["commit"] = ""; a["pr"] = ""; d["attribution"] = a; d["includeCoAuthoredBy"] = False
+elif act == "revert":
+    o = json.load(open(state, encoding="utf-8"))
+    if o["has_a"]: d["attribution"] = o["a"]
+    else: d.pop("attribution", None)
+    if o["has_i"]: d["includeCoAuthoredBy"] = o["i"]
+    else: d.pop("includeCoAuthoredBy", None)
+print(json.dumps(d, indent=2, ensure_ascii=False))
+'
+
+JSON_JS='
+const fs = require("fs");
+const [act, path, state] = process.argv.slice(1);
+const text = fs.existsSync(path) ? fs.readFileSync(path, "utf8") : "";
+const d = text.trim() ? JSON.parse(text) : {};
+if (typeof d !== "object" || d === null || Array.isArray(d)) process.exit(2);
+const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+const ours = (d) => isObj(d.attribution) && d.attribution.commit === "" && d.attribution.pr === "" && d.includeCoAuthoredBy === false;
+if (act === "status") process.exit(ours(d) ? 0 : 1);
+if (act === "orig") {
+  const has = (k) => Object.prototype.hasOwnProperty.call(d, k);
+  console.log(JSON.stringify({ has_a: has("attribution"), a: has("attribution") ? d.attribution : null,
+    has_i: has("includeCoAuthoredBy"), i: has("includeCoAuthoredBy") ? d.includeCoAuthoredBy : null }));
+  process.exit(0);
+}
+if (act === "apply") {
+  d.attribution = Object.assign({}, isObj(d.attribution) ? d.attribution : {}, { commit: "", pr: "" });
+  d.includeCoAuthoredBy = false;
+} else if (act === "revert") {
+  const o = JSON.parse(fs.readFileSync(state, "utf8"));
+  if (o.has_a) d.attribution = o.a; else delete d.attribution;
+  if (o.has_i) d.includeCoAuthoredBy = o.i; else delete d.includeCoAuthoredBy;
+}
+process.stdout.write(JSON.stringify(d, null, 2) + "\n");
+'
+
+json_tool() {
+  if [ -n "${GAG_JSON_TOOL:-}" ]; then printf '%s' "$GAG_JSON_TOOL"; return; fi
+  for _t in jq node python3; do
+    if command -v "$_t" >/dev/null 2>&1; then printf '%s' "$_t"; return; fi
+  done
+  return 1
+}
+
+gag_json() {
+  _act=$1; _file=$2; _state=${3:-}
+  _tool=$(json_tool) || gag_die "need jq, node or python3 to edit Claude Code settings"
+  case $_tool in
+    jq)
+      _in=$_file
+      if [ ! -s "$_file" ]; then _in=$(gag_tmp); printf '{}\n' > "$_in"; fi
+      jq -e 'type == "object"' "$_in" >/dev/null 2>&1 || { [ "$_in" = "$_file" ] || rm -f "$_in"; return 2; }
+      case $_act in
+        status) jq -e '(.attribution | type) == "object" and .attribution.commit == "" and .attribution.pr == "" and .includeCoAuthoredBy == false' "$_in" >/dev/null 2>&1 ;;
+        orig) jq -c '{has_a: has("attribution"), a: .attribution, has_i: has("includeCoAuthoredBy"), i: .includeCoAuthoredBy}' "$_in" ;;
+        apply) jq '.attribution = ((if (.attribution | type) == "object" then .attribution else {} end) + {commit: "", pr: ""}) | .includeCoAuthoredBy = false' "$_in" ;;
+        revert) jq --slurpfile s "$_state" '$s[0] as $o
+          | (if $o.has_a then .attribution = $o.a else del(.attribution) end)
+          | (if $o.has_i then .includeCoAuthoredBy = $o.i else del(.includeCoAuthoredBy) end)' "$_in" ;;
+      esac
+      _rc=$?; [ "$_in" = "$_file" ] || rm -f "$_in"; return "$_rc" ;;
+    node) node -e "$JSON_JS" "$_act" "$_file" "$_state" ;;
+    python3) python3 -c "$JSON_PY" "$_act" "$_file" "$_state" ;;
+    *) gag_die "unknown GAG_JSON_TOOL '$_tool' (use jq, node or python3)" ;;
+  esac
+}
+
+claude_settings_file() {
+  if [ "$1" = global ]; then printf '%s/settings.json' "$GAG_CLAUDE_GLOBAL"
+  else printf '%s/.claude/settings.json' "$(git rev-parse --show-toplevel)"; fi
+}
+
+state_dir() {
+  if [ "$1" = global ]; then printf '%s' "$GAG_STATE_GLOBAL"
+  else printf '%s/attribution-guard' "$(gag_common_dir)"; fi
+}
+
+claude_apply() {
+  _sf=$(claude_settings_file "$1"); _st="$(state_dir "$1")/claude-settings.orig.json"
+  if [ -f "$_sf" ] && gag_json status "$_sf"; then gag_ok "Claude Code attribution already off ($_sf)"; return 0; fi
+  if [ -f "$_sf" ]; then gag_json status "$_sf"; [ $? -eq 2 ] && gag_die "$_sf is not a JSON object; left unchanged"; fi
+  mkdir -p "$(dirname -- "$_st")" "$(dirname -- "$_sf")" || gag_die "cannot create directories for $_sf"
+  if [ ! -f "$_st" ]; then
+    (umask 077; gag_json orig "$_sf" > "$_st") || { rm -f "$_st"; gag_die "cannot parse $_sf (invalid JSON?); left unchanged"; }
+  fi
+  _new=$(gag_tmp)
+  gag_json apply "$_sf" > "$_new" || { rm -f "$_new"; gag_die "cannot parse $_sf (invalid JSON?); left unchanged"; }
+  if [ -f "$_sf" ]; then gag_note "backup: $(backup_file "$_sf")"; fi
+  replace_file "$_sf" "$_new" || { rm -f "$_new"; gag_die "cannot write $_sf"; }
+  rm -f "$_new"
+  gag_ok "Claude Code attribution turned off ($_sf)"
+}
+
+claude_revert() {
+  _sf=$(claude_settings_file "$1"); _st="$(state_dir "$1")/claude-settings.orig.json"
+  [ -f "$_st" ] || return 0
+  if [ ! -f "$_sf" ]; then rm -f "$_st"; return 0; fi
+  if ! gag_json status "$_sf"; then
+    gag_warn "$_sf was changed after install; leaving its attribution settings as they are"
+    rm -f "$_st"; return 0
+  fi
+  _new=$(gag_tmp)
+  gag_json revert "$_sf" "$_st" > "$_new" || { rm -f "$_new"; gag_die "cannot update $_sf"; }
+  gag_note "backup: $(backup_file "$_sf")"
+  replace_file "$_sf" "$_new" || { rm -f "$_new"; gag_die "cannot write $_sf"; }
+  rm -f "$_new" "$_st"
+  gag_ok "Claude Code attribution settings restored ($_sf)"
+}
+
+# ---------------------------------------------------- agent instructions ---
+
+AGENT_BEGIN='<!-- >>> git-attribution-guard >>> -->'
+AGENT_END='<!-- <<< git-attribution-guard <<< -->'
+
+agent_block() {
+  cat <<EOF
+$AGENT_BEGIN
+## Commit attribution
+
+- Never add \`Co-authored-by:\`, \`Co-developed-by:\`, \`Assisted-by:\` or "Generated with ..." lines to commits, pull requests or release notes.
+- Commit only as the configured git user (\`git config user.name\` / \`git config user.email\`).
+- Run \`attribution status\` before committing or pushing and follow its output.
+$AGENT_END
+EOF
+}
+
+agent_files() {
+  if [ "$1" = global ]; then printf '%s\n' "$GAG_CLAUDE_GLOBAL/CLAUDE.md"; return; fi
+  _top=$(git rev-parse --show-toplevel)
+  _any=0
+  for _n in AGENTS.md CLAUDE.md; do
+    if [ -f "$_top/$_n" ]; then printf '%s\n' "$_top/$_n"; _any=1; fi
+  done
+  [ "$_any" = 1 ] || printf '%s\n' "$_top/AGENTS.md"
+}
+
+agent_apply() {
+  agent_files "$1" | while IFS= read -r _f; do
+    if [ -f "$_f" ] && grep -qF "$AGENT_BEGIN" "$_f"; then gag_ok "agent instructions already in $_f"; continue; fi
+    mkdir -p "$(dirname -- "$_f")"
+    if [ -f "$_f" ]; then
+      gag_note "backup: $(backup_file "$_f")"
+      _sep=; [ ! -s "$_f" ] || _sep=1
+      { [ -z "$_sep" ] || printf '\n'; agent_block; } >> "$_f"
+    else
+      agent_block > "$_f"
+    fi
+    gag_ok "agent instructions added to $_f"
+  done
+}
+
+agent_revert() {
+  if [ "$1" = global ]; then _files="$GAG_CLAUDE_GLOBAL/CLAUDE.md"
+  else _top=$(git rev-parse --show-toplevel); _files="$_top/AGENTS.md
+$_top/CLAUDE.md"; fi
+  printf '%s\n' "$_files" | while IFS= read -r _f; do
+    remove_block "$_f" "$AGENT_BEGIN" "$AGENT_END" || continue
+    if ! grep -q '[^[:space:]]' "$_f"; then rm -f "$_f"; fi
+    gag_ok "agent instructions removed from $_f"
+  done
+}
+
+# ------------------------------------------------- foreign hook systems ---
+
+HOOK_CALL_COMMENT='# Added by `attribution install --local`; remove with `attribution uninstall --local`.'
+
+hook_block() {
+  printf '%s\n%s\n' "$GAG_MARK_BEGIN" "$HOOK_CALL_COMMENT"
+  if [ "$1" = pre-push ]; then
+    cat <<'EOF'
+if command -v attribution >/dev/null 2>&1; then
+  _gag_in=$(mktemp "${TMPDIR:-/tmp}/gag.XXXXXX") || exit 1
+  cat > "$_gag_in"
+  attribution hook pre-push "$@" < "$_gag_in" || { rm -f "$_gag_in"; exit 1; }
+  exec < "$_gag_in"
+  rm -f "$_gag_in"
+fi
+EOF
+  else
+    printf 'if command -v attribution >/dev/null 2>&1; then\n  attribution hook %s "$@" || exit 1\nfi\n' "$1"
+  fi
+  printf '%s\n' "$GAG_MARK_END"
+}
+
+# Husky v9 uses core.hooksPath=.husky/_ and runs user scripts from .husky/.
+integration_target() {
+  _d=$1
+  case $(basename -- "$_d") in _) dirname -- "$_d" ;; *) printf '%s' "$_d" ;; esac
+}
+
+integrate_hooks() {
+  _dir=$1; _target=$(integration_target "$_dir"); _state=$(state_dir local)
+  mkdir -p "$_state/backup" "$_target"
+  _manifest="$_state/integrated"
+  for _h in $GAG_MANAGED_HOOKS; do
+    _f="$_target/$_h"
+    if [ -f "$_f" ] && grep -qF "$GAG_MARK_BEGIN" "$_f"; then gag_ok "already integrated: $_f"; continue; fi
+    _t=$(gag_tmp)
+    if [ -f "$_f" ]; then
+      _bk="$_state/backup/$(printf '%s' "$_h").$(timestamp)"
+      cp -p "$_f" "$_bk" || gag_die "cannot back up $_f"
+      GAG_BLK=$(hook_block "$_h") awk 'BEGIN { blk = ENVIRON["GAG_BLK"] } NR == 1 && /^#!/ { print; print blk; done = 1; next }
+        NR == 1 { print blk; done = 1 } { print } END { if (!done) print blk }' "$_f" > "$_t"
+      replace_file "$_f" "$_t" || gag_die "cannot write $_f"
+      printf 'modified\t%s\n' "$_f" >> "$_manifest"
+      gag_ok "added guard call to existing hook $_f (backup: $_bk)"
+    else
+      { printf '#!/bin/sh\n'; hook_block "$_h"; } > "$_t"
+      if ! { cat "$_t" > "$_f" && chmod 755 "$_f"; }; then gag_die "cannot write $_f"; fi
+      printf 'created\t%s\n' "$_f" >> "$_manifest"
+      gag_ok "created hook $_f"
+    fi
+    rm -f "$_t"
+  done
+}
+
+unintegrate_hooks() {
+  _manifest="$(state_dir local)/integrated"
+  [ -f "$_manifest" ] || return 0
+  while IFS='	' read -r _kind _f; do
+    remove_block "$_f" "$GAG_MARK_BEGIN" "$GAG_MARK_END" || continue
+    if [ "$_kind" = created ] && ! grep -v '^#!' "$_f" | grep -q '[^[:space:]]'; then rm -f "$_f"; fi
+    gag_ok "removed guard call from $_f"
+  done < "$_manifest"
+  rm -f "$_manifest"
+}
+
+# Effective hooks directory for the current repo and whether we run there.
+# Prints: active-global | active-local | integrated | inactive:<reason>
+hooks_state() {
+  _top=$(git rev-parse --show-toplevel 2>/dev/null) || { printf 'inactive:not a repository'; return; }
+  _eff=$(git config --path --get core.hooksPath 2>/dev/null)
+  if [ -z "$_eff" ]; then printf 'inactive:core.hooksPath not set (run: attribution install)'; return; fi
+  _effc=$(cd "$_top" && gag_canon "$_eff")
+  if [ -n "$_effc" ] && [ "$_effc" = "$(hooks_dir_canon)" ]; then
+    if git config --local --get core.hooksPath >/dev/null 2>&1; then printf 'active-local'; else printf 'active-global'; fi
+    return
+  fi
+  _tgt=$(integration_target "${_effc:-$_eff}")
+  _n=0
+  for _h in $GAG_MANAGED_HOOKS; do
+    if [ -f "$_tgt/$_h" ] && grep -qF "$GAG_MARK_BEGIN" "$_tgt/$_h"; then _n=$((_n + 1)); fi
+  done
+  if [ "$_n" -eq 3 ]; then printf 'integrated'; return; fi
+  printf 'inactive:core.hooksPath=%s overrides the guard (run: attribution install --local)' "$_eff"
+}
+
+# -------------------------------------------------------------- commands ---
+
+cmd_install() {
+  SCOPE=global; _agent=0
+  while [ $# -gt 0 ]; do
+    scope_flag "$1" || case $1 in
+      --agent-instructions) _agent=1 ;;
+      -h|--help) cmd_help install; return 0 ;;
+      *) gag_die "install: unknown option '$1'" ;;
+    esac
+    shift
+  done
+  ensure_hook_files
+  _ours=$(hooks_dir_canon)
+
+  if [ "$SCOPE" = global ]; then
+    _cur=$(git config --global --path --get core.hooksPath 2>/dev/null)
+    _curc=$(gag_canon "$_cur" 2>/dev/null)
+    if [ -n "$_cur" ] && [ "$_curc" = "$_ours" ]; then
+      gag_ok "global hooks already installed ($_ours)"
+    else
+      if [ -n "$_cur" ]; then
+        git config --global attribution.previousHooksPath "$_cur"
+        gag_warn "global core.hooksPath was '$_cur'; it is remembered and its hooks are chained"
+      fi
+      git config --global core.hooksPath "$_ours"
+      gag_ok "global core.hooksPath -> $_ours"
+    fi
+    claude_apply global
+    [ "$_agent" = 0 ] || agent_apply global
+    if git rev-parse --git-dir >/dev/null 2>&1; then
+      case $(hooks_state) in inactive:*) gag_warn "this repository: $(hooks_state | cut -d: -f2-)" ;; esac
+    fi
+  else
+    need_repo
+    _local=$(git config --local --path --get core.hooksPath 2>/dev/null)
+    _top=$(git rev-parse --show-toplevel)
+    if [ -n "$_local" ] && [ "$(cd "$_top" && gag_canon "$_local")" = "$_ours" ]; then
+      gag_ok "local hooks already installed"
+    elif [ -n "$_local" ]; then
+      gag_note "repository uses its own core.hooksPath ($_local); integrating instead of replacing"
+      (cd "$_top" && integrate_hooks "$_local")
+    else
+      _glob=$(git config --global --path --get core.hooksPath 2>/dev/null)
+      if [ -n "$_glob" ] && [ "$(gag_canon "$_glob")" = "$_ours" ]; then
+        gag_ok "global hooks already active here; nothing to change"
+      else
+        if [ -n "$_glob" ]; then git config --local attribution.previousHooksPath "$_glob"; fi
+        git config --local core.hooksPath "$_ours"
+        gag_ok "local core.hooksPath -> $_ours (repository hooks in .git/hooks still run)"
+      fi
+    fi
+    claude_apply local
+    [ "$_agent" = 0 ] || agent_apply local
+  fi
+  gag_note "next: attribution status"
+}
+
+cmd_uninstall() {
+  SCOPE=global
+  while [ $# -gt 0 ]; do
+    scope_flag "$1" || case $1 in
+      -h|--help) cmd_help uninstall; return 0 ;;
+      *) gag_die "uninstall: unknown option '$1'" ;;
+    esac
+    shift
+  done
+  _ours=$(hooks_dir_canon)
+  if [ "$SCOPE" = global ]; then
+    _cur=$(git config --global --path --get core.hooksPath 2>/dev/null)
+    if [ -n "$_cur" ] && [ "$(gag_canon "$_cur")" = "$_ours" ]; then
+      _prev=$(git config --global --get attribution.previousHooksPath 2>/dev/null)
+      if [ -n "$_prev" ]; then
+        git config --global core.hooksPath "$_prev"; gag_ok "global core.hooksPath restored to $_prev"
+      else
+        git config --global --unset core.hooksPath; gag_ok "global core.hooksPath removed"
+      fi
+    fi
+    git config --global --unset attribution.previousHooksPath 2>/dev/null || :
+    claude_revert global
+    agent_revert global
+  else
+    need_repo
+    _local=$(git config --local --path --get core.hooksPath 2>/dev/null)
+    _top=$(git rev-parse --show-toplevel)
+    if [ -n "$_local" ] && [ "$(cd "$_top" && gag_canon "$_local")" = "$_ours" ]; then
+      git config --local --unset core.hooksPath; gag_ok "local core.hooksPath removed"
+    fi
+    git config --local --unset attribution.previousHooksPath 2>/dev/null || :
+    unintegrate_hooks
+    claude_revert local
+    agent_revert local
+  fi
+  gag_note "preferences (attribution.*) were kept; remove with: git config --$SCOPE --remove-section attribution"
+}
+
+cmd_status() {
+  case ${1:-} in -h|--help) cmd_help status; return 0 ;; esac
+  printf '%sattribution %s%s  %s(%s)%s\n' "$GAG_C_BLD" "$GAG_VERSION" "$GAG_C_OFF" "$GAG_C_DIM" "$GAG_ROOT" "$GAG_C_OFF"
+  _row() { printf '  %-14s %-34s %s%s%s\n' "$1" "$2" "$GAG_C_DIM" "$3" "$GAG_C_OFF"; }
+  _row enabled "$(gag_bool enabled true)" "$(scope_of attribution.enabled)"
+  _row mode "$(gag_mode 2>/dev/null)" "$(scope_of attribution.mode)"
+  _row blockPush "$(gag_bool blockPush true)" "$(scope_of attribution.blockPush)"
+  _a=$(gag_cfg authorName); _e=$(gag_cfg authorEmail)
+  if [ -n "$_a$_e" ]; then _row author "${_a:-*} <${_e:-*}>" "$(scope_of attribution.authorEmail)"
+  else _row author "(not enforced)" default; fi
+  for _s in global local; do
+    _l=$(git config "--$_s" --get-all attribution.allow 2>/dev/null | tr '\n' ' ')
+    [ -z "$_l" ] || _row allow "$_l" "$_s"
+  done
+  _x=$(git config --get-all attribution.extraPatterns 2>/dev/null | tr '\n' ' ')
+  [ -z "$_x" ] || _row extraPatterns "$_x" "$(scope_of attribution.extraPatterns)"
+
+  printf '%shooks%s\n' "$GAG_C_BLD" "$GAG_C_OFF"
+  _g=$(git config --global --path --get core.hooksPath 2>/dev/null)
+  if [ -n "$_g" ] && [ "$(gag_canon "$_g")" = "$(hooks_dir_canon)" ]; then _row global "installed" "$_g"
+  elif [ -n "$_g" ]; then _row global "other core.hooksPath" "$_g"
+  else _row global "not installed" "attribution install"; fi
+  if git rev-parse --git-dir >/dev/null 2>&1; then
+    _hs=$(hooks_state)
+    case $_hs in
+      active-*) _row "this repo" "${GAG_C_GRN}active${GAG_C_OFF} (${_hs#active-})" "$(git rev-parse --show-toplevel)" ;;
+      integrated) _row "this repo" "${GAG_C_GRN}active${GAG_C_OFF} (integrated)" "$(git config --get core.hooksPath)" ;;
+      *) _row "this repo" "${GAG_C_RED}NOT active${GAG_C_OFF}" "${_hs#inactive:}" ;;
+    esac
+  else
+    _row "this repo" "(not in a repository)" ""
+  fi
+
+  printf '%sClaude Code%s\n' "$GAG_C_BLD" "$GAG_C_OFF"
+  _cs() {
+    _f=$(claude_settings_file "$1")
+    if [ ! -f "$_f" ]; then _row "$1" "no settings file" "$_f"
+    elif ! json_tool >/dev/null; then _row "$1" "unknown (no jq/node/python3)" "$_f"
+    elif gag_json status "$_f"; then _row "$1" "attribution off" "$_f"
+    else _row "$1" "attribution NOT off" "$_f"; fi
+  }
+  _cs global
+  if git rev-parse --git-dir >/dev/null 2>&1; then _cs local; fi
+}
+
+cmd_onoff() {
+  _v=$1; shift; SCOPE=global
+  while [ $# -gt 0 ]; do
+    scope_flag "$1" || case $1 in -h|--help) cmd_help on; return 0 ;; *) gag_die "unknown option '$1'" ;; esac
+    shift
+  done
+  cfg_set attribution.enabled "$_v"
+  if [ "$_v" = true ]; then gag_ok "attribution guard ON ($SCOPE)"; else gag_ok "attribution guard OFF ($SCOPE)"; fi
+}
+
+cmd_mode() {
+  SCOPE=global; _m=
+  while [ $# -gt 0 ]; do
+    scope_flag "$1" || case $1 in
+      -h|--help) cmd_help mode; return 0 ;;
+      strip-ai|allowlist|strip-all|off) _m=$1 ;;
+      *) gag_die "mode: invalid value '$1' (strip-ai|allowlist|strip-all|off)" ;;
+    esac
+    shift
+  done
+  [ -n "$_m" ] || { printf '%s\n' "$(gag_mode)"; return 0; }
+  cfg_set attribution.mode "$_m"
+  gag_ok "mode = $_m ($SCOPE)"
+  if [ "$_m" = allowlist ] && [ -z "$(gag_allow)" ]; then
+    gag_warn "allowlist is empty: every co-author will be removed (add one: attribution allow add <email>)"
+  fi
+}
+
+cmd_allow() {
+  SCOPE=global; _sub=${1:-}; [ $# -eq 0 ] || shift; _email=
+  case $_sub in -h|--help|'') cmd_help allow; return 0 ;; esac
+  while [ $# -gt 0 ]; do
+    scope_flag "$1" || case $1 in -h|--help) cmd_help allow; return 0 ;; -*) gag_die "allow: unknown option '$1'" ;; *) _email=$1 ;; esac
+    shift
+  done
+  case $_sub in
+    list)
+      for _s in global local; do
+        git config "--$_s" --get-all attribution.allow 2>/dev/null | while IFS= read -r _v; do printf '%s\t%s\n' "$_v" "$_s"; done
+      done ;;
+    add|remove)
+      [ -n "$_email" ] || gag_die "allow $_sub: missing <email>"
+      case $_email in *@*) ;; *) gag_die "allow: '$_email' is not an email (use name@host or @domain)" ;; esac
+      case $_email in *[[:space:]\<\>]*) gag_die "allow: email must not contain spaces or <>" ;; esac
+      _email=$(gag_lower "$_email")
+      _re="^$(regex_escape "$_email")\$"
+      if [ "$_sub" = add ]; then
+        if git config "--$SCOPE" --get-all attribution.allow "$_re" >/dev/null 2>&1; then gag_ok "$_email already allowed ($SCOPE)"
+        else cfg_set --add attribution.allow "$_email"; gag_ok "allowed $_email ($SCOPE)"; fi
+      else
+        if cfg_set --unset-all attribution.allow "$_re" 2>/dev/null; then gag_ok "removed $_email ($SCOPE)"
+        else gag_warn "$_email was not in the $SCOPE allowlist"; fi
+      fi ;;
+    *) gag_die "allow: expected add|remove|list" ;;
+  esac
+}
+
+cmd_author() {
+  SCOPE=global; _sub=${1:-}; [ $# -eq 0 ] || shift
+  case $_sub in -h|--help|'') cmd_help author; return 0 ;; esac
+  _n=; _e=; _pos=0
+  while [ $# -gt 0 ]; do
+    scope_flag "$1" || { _pos=$((_pos + 1)); if [ "$_pos" = 1 ]; then _n=$1; else _e=$1; fi; }
+    shift
+  done
+  case $_sub in
+    set)
+      [ -n "$_n" ] && [ -n "$_e" ] || gag_die 'usage: attribution author set "<Name>" <email>'
+      case $_e in *@*) ;; *) gag_die "author: '$_e' is not an email" ;; esac
+      cfg_set attribution.authorName "$_n"; cfg_set attribution.authorEmail "$_e"
+      gag_ok "expected author = $_n <$_e> ($SCOPE)"
+      _cur=$(git config --get user.email 2>/dev/null)
+      if [ -n "$_cur" ] && [ "$(gag_lower "$_cur")" != "$(gag_lower "$_e")" ]; then
+        gag_warn "git user.email is '$_cur'; commits will be blocked until it matches"
+      fi ;;
+    clear)
+      cfg_set --unset attribution.authorName 2>/dev/null || :
+      cfg_set --unset attribution.authorEmail 2>/dev/null || :
+      gag_ok "author enforcement cleared ($SCOPE)" ;;
+    *) gag_die "author: expected set|clear" ;;
+  esac
+}
+
+check_mode() {
+  _m=$(gag_mode)
+  if [ "$_m" = off ]; then _m=strip-ai; gag_note "mode is off; checking with strip-ai rules" >&2; fi
+  printf '%s' "$_m"
+}
+
+cmd_check() {
+  case ${1:-} in -h|--help) cmd_help check; return 0 ;; esac
+  need_repo
+  [ $# -gt 0 ] || set -- HEAD
+  git rev-parse --verify -q HEAD >/dev/null || { gag_ok "no commits yet"; return 0; }
+  _m=$(check_mode)
+  _out=$(gag_tmp)
+  GAG_MODE=$_m gag_scan "$@" > "$_out" || { rm -f "$_out"; gag_die "git log failed for: $*"; }
+  if [ -s "$_out" ]; then
+    _n=$(cut -f1 "$_out" | sort -u | wc -l | tr -d ' ')
+    gag_err "$_n commit(s) with disallowed attribution (mode: $_m):"
+    gag_print_findings < "$_out"
+    gag_note "preview a fix: attribution rewrite $* --dry-run"
+    rm -f "$_out"; return 1
+  fi
+  rm -f "$_out"
+  gag_ok "no disallowed attribution in $* (mode: $_m)"
+}
+
+REWRITE_PY='
+import os
+g = globals()
+if "_gag_map" not in g:
+    d = os.environ["GAG_MAP_DIR"]
+    m = {}
+    for n in os.listdir(os.path.join(d, "old")):
+        with open(os.path.join(d, "old", n), "rb") as f:
+            k = f.read()
+        with open(os.path.join(d, "new", n), "rb") as f:
+            m[k] = f.read()
+    g["_gag_map"] = m
+return g["_gag_map"].get(message, message)
+'
+
+filter_repo_help() {
+  gag_err "git filter-repo is required for rewrite"
+  gag_note "install one of:  pipx install git-filter-repo   |  brew install git-filter-repo"
+  gag_note "                 apt install git-filter-repo    |  python3 -m pip install --user git-filter-repo"
+  gag_note "docs: https://github.com/newren/git-filter-repo"
+}
+
+cmd_rewrite() {
+  _dry=0; _ai=0; _mm=; _range=
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -h|--help) cmd_help rewrite; return 0 ;;
+      --dry-run|-n) _dry=1 ;;
+      --remove-ai) _ai=1 ;;
+      --mailmap) [ $# -ge 2 ] || gag_die "--mailmap needs a file"; _mm=$2; shift ;;
+      --mailmap=*) _mm=${1#--mailmap=} ;;
+      -*) gag_die "rewrite: unknown option '$1'" ;;
+      *) [ -z "$_range" ] || gag_die "rewrite: only one revision range is supported"; _range=$1 ;;
+    esac
+    shift
+  done
+  need_repo
+  _top=$(git rev-parse --show-toplevel); cd "$_top" || exit 1
+  if [ -n "$_mm" ]; then
+    [ -f "$_mm" ] || gag_die "mailmap file not found: $_mm"
+    _mm=$(gag_canon "$(dirname -- "$_mm")")/$(basename -- "$_mm")
+  fi
+  [ "$_ai" = 1 ] || [ -n "$_mm" ] || _ai=1
+  if [ -z "$_range" ]; then
+    _range=$(git symbolic-ref -q HEAD) || gag_die "detached HEAD: pass a branch or range, e.g. attribution rewrite main"
+  fi
+  git rev-list -n1 "$_range" -- >/dev/null 2>&1 || gag_die "invalid revision range: $_range"
+
+  _work=$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/gag-rewrite.XXXXXX") || gag_die "cannot create temp dir"
+  mkdir "$_work/old" "$_work/new"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$_work'" EXIT INT TERM
+  _changes=0; _msgs=0
+
+  printf '%sRewrite plan for %s%s\n' "$GAG_C_BLD" "$_range" "$GAG_C_OFF"
+  if [ "$_ai" = 1 ]; then
+    _m=$(check_mode)
+    GAG_MODE=$_m gag_scan "$_range" > "$_work/scan" || gag_die "git log failed"
+    awk -F '\t' '$2 != "AI author" && $2 != "AI committer" && !s[$1]++ { print $1 }' "$_work/scan" > "$_work/shas"
+    _i=0
+    while IFS= read -r _sha; do
+      _i=$((_i + 1))
+      _hl=$(git cat-file commit "$_sha" | awk '/^$/ { print NR; exit }')
+      git cat-file commit "$_sha" | tail -n "+$((_hl + 1))" > "$_work/old/$_i"
+      : > "$_work/removed"
+      if ! GAG_MODE=$_m GAG_REMOVED_FILE="$_work/removed" gag_filter_msg "$_work/old/$_i" "$_work/new/$_i"; then
+        rm -f "$_work/old/$_i" "$_work/new/$_i"; continue
+      fi
+      _msgs=$((_msgs + 1))
+      printf '  %s%s%s %s\n' "$GAG_C_BLD" "$(printf '%s' "$_sha" | cut -c1-12)" "$GAG_C_OFF" "$(git log -1 --format=%s "$_sha")"
+      while IFS= read -r _l; do printf '      %s- %s%s\n' "$GAG_C_RED" "${_l%%	*}" "$GAG_C_OFF"; done < "$_work/removed"
+    done < "$_work/shas"
+    _changes=$((_changes + _msgs))
+    if awk -F '\t' '$2 == "AI author" || $2 == "AI committer" { f = 1 } END { exit !f }' "$_work/scan"; then
+      gag_warn "commits with an AI/bot author or committer need a mailmap to fix:"
+      awk -F '\t' '($2 == "AI author" || $2 == "AI committer") && !s[$3]++ { print "      " $3 }' "$_work/scan" >&2
+      gag_note "mailmap line format: Your Name <you@example.com> <bot@example.com>"
+    fi
+  fi
+  if [ -n "$_mm" ]; then
+    git log --format='%an <%ae>%n%cn <%ce>' "$_range" | sort -u > "$_work/idents"
+    while IFS= read -r _id; do
+      _to=$(git -c mailmap.file="$_mm" check-mailmap "$_id" 2>/dev/null) || continue
+      if [ "$_to" != "$_id" ]; then
+        printf '  %s%s%s -> %s%s%s\n' "$GAG_C_RED" "$_id" "$GAG_C_OFF" "$GAG_C_GRN" "$_to" "$GAG_C_OFF"
+        _changes=$((_changes + 1))
+      fi
+    done < "$_work/idents"
+  fi
+  if [ "$_changes" -eq 0 ]; then gag_ok "nothing to rewrite in $_range"; return 0; fi
+  if [ "$_dry" = 1 ]; then gag_ok "dry run: nothing was changed ($_changes change(s) planned)"; return 0; fi
+
+  git filter-repo --version >/dev/null 2>&1 || { filter_repo_help; return 1; }
+  if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    gag_die "working tree has uncommitted changes; commit or stash them first"
+  fi
+
+  _ts=$(timestamp)
+  git for-each-ref --format='%(refname)' refs/heads refs/tags | while IFS= read -r _r; do
+    git update-ref "refs/attribution-backup/$_ts/${_r#refs/}" "$_r"
+  done
+  gag_ok "backup refs: refs/attribution-backup/$_ts/"
+
+  printf '\n%sThis rewrites commit history of %s. Commit SHAs will change.%s\n' "$GAG_C_YEL" "$_range" "$GAG_C_OFF" >&2
+  printf "Type 'rewrite' to continue: " >&2
+  read -r _ans || _ans=
+  [ "$_ans" = rewrite ] || gag_die "aborted; nothing rewritten (backup refs kept under refs/attribution-backup/$_ts/)"
+
+  _origin=$(git remote get-url origin 2>/dev/null) || _origin=
+  _opush=$(git remote get-url --push origin 2>/dev/null) || _opush=
+  set -- --force --refs "$_range"
+  [ -z "$_mm" ] || set -- "$@" --mailmap "$_mm"
+  [ "$_msgs" -eq 0 ] || set -- "$@" --message-callback "$REWRITE_PY"
+  GAG_MAP_DIR=$_work git filter-repo "$@" || gag_die "git filter-repo failed; restore with the backup refs under refs/attribution-backup/$_ts/"
+
+  if [ -n "$_origin" ] && ! git remote get-url origin >/dev/null 2>&1; then
+    git remote add origin "$_origin"
+    [ "$_opush" = "$_origin" ] || git remote set-url --push origin "$_opush"
+    gag_ok "remote 'origin' restored ($_origin)"
+  fi
+  gag_ok "history rewritten"
+  cat >&2 <<EOF
+
+Next steps (not run automatically):
+  attribution check $_range
+  git push --force-with-lease --all origin
+  git push --force-with-lease --tags origin
+
+${GAG_C_YEL}Warnings${GAG_C_OFF}
+  - Everyone else must re-clone, or run: git fetch && git reset --hard origin/<branch>
+  - GitHub's contributors graph can take hours to days to refresh.
+  - Undo locally: git update-ref <ref> refs/attribution-backup/$_ts/<ref-without-refs/>
+  - Delete backups when happy: git for-each-ref --format='%(refname)' refs/attribution-backup/$_ts | xargs -n1 git update-ref -d
+EOF
+}
+
+cmd_doctor() {
+  _bad=0
+  _fail() { gag_err "$*"; _bad=1; }
+  printf '%sattribution doctor%s\n' "$GAG_C_BLD" "$GAG_C_OFF"
+
+  _gv=$(git --version | awk '{ print $3 }')
+  case $_gv in 1.*|2.[0-8].*) _fail "git $_gv is too old; need 2.9+ (core.hooksPath)" ;; *) gag_ok "git $_gv" ;; esac
+
+  if command -v attribution >/dev/null 2>&1; then gag_ok "attribution on PATH ($(command -v attribution))"
+  else gag_warn "attribution is not on PATH (add ~/.local/bin); Husky/foreign hook integration needs it"; fi
+
+  for _h in $GAG_MANAGED_HOOKS; do
+    _f="$GAG_HOOKS_DIR/$_h"
+    if [ ! -f "$_f" ]; then _fail "missing hook $_f"
+    elif [ ! -x "$_f" ]; then _fail "hook not executable: $_f (fix: attribution install)"
+    fi
+  done
+  _cr=$(printf '\r')
+  for _f in "$GAG_HOOKS_DIR"/* "$GAG_ROOT/core.sh" "$GAG_ROOT/patterns.sh" "$GAG_ROOT/attribution"; do
+    [ -f "$_f" ] || continue
+    if grep -q "$_cr" "$_f"; then _fail "Windows (CRLF) line endings in $_f; reinstall from a checkout with LF (.gitattributes)"; fi
+  done
+  [ "$_bad" = 1 ] || gag_ok "hook files present, executable, LF line endings"
+
+  _g=$(git config --global --path --get core.hooksPath 2>/dev/null)
+  if [ -z "$_g" ]; then gag_warn "global hooks not installed (attribution install)"
+  elif [ "$(gag_canon "$_g")" = "$(hooks_dir_canon)" ]; then gag_ok "global core.hooksPath -> guard"
+  else gag_warn "global core.hooksPath is another tool's ($_g)"; fi
+  _p=$(git config --global --path --get attribution.previousHooksPath 2>/dev/null)
+  if [ -n "$_p" ] && [ ! -d "$_p" ]; then gag_warn "remembered previous hooksPath '$_p' no longer exists"; fi
+
+  if git rev-parse --git-dir >/dev/null 2>&1; then
+    case $(hooks_state) in
+      active-*|integrated) gag_ok "hooks active in this repository ($(hooks_state))" ;;
+      *) _fail "hooks NOT active in this repository: $(hooks_state | cut -d: -f2-)" ;;
+    esac
+    _ch=$(gag_chain_dir 2>/dev/null)
+    if [ -n "$_ch" ] && [ -d "$_ch" ]; then
+      for _h in "$_ch"/*; do
+        [ -f "$_h" ] || continue
+        case $_h in *.sample) continue ;; esac
+        [ -x "$_h" ] || gag_warn "repository hook not executable, will not run: $_h"
+      done
+    fi
+    if [ -n "$(gag_cfg authorEmail)" ]; then
+      _ue=$(git config --get user.email 2>/dev/null)
+      if [ "$(gag_lower "$_ue")" != "$(gag_lower "$(gag_cfg authorEmail)")" ]; then
+        gag_warn "user.email '$_ue' differs from attribution.authorEmail '$(gag_cfg authorEmail)'; commits will be blocked"
+      fi
+    fi
+  fi
+
+  _pats=$(git config --get-all attribution.extraPatterns 2>/dev/null)
+  if [ -n "$_pats" ]; then
+    printf '%s\n' "$_pats" | while IFS= read -r _p; do
+      if ! printf 'x\n' | GAG_P=$_p LC_ALL=C awk '{ p = ENVIRON["GAG_P"]; gsub(/\\b/, "[^a-z0-9]", p); if ($0 ~ p) {} }' 2>/dev/null; then
+        gag_err "invalid attribution.extraPatterns regex: $_p"; exit 1
+      fi
+    done || _bad=1
+  fi
+
+  if git filter-repo --version >/dev/null 2>&1; then gag_ok "git filter-repo $(git filter-repo --version 2>/dev/null) (needed only for rewrite)"
+  else gag_warn "git filter-repo not installed (needed only for rewrite): pipx install git-filter-repo"; fi
+
+  if _t=$(json_tool); then gag_ok "JSON tool: $_t"; else gag_warn "no jq/node/python3: Claude Code settings cannot be edited"; fi
+  for _s in global local; do
+    [ "$_s" = global ] || git rev-parse --git-dir >/dev/null 2>&1 || continue
+    _f=$(claude_settings_file "$_s")
+    [ -f "$_f" ] || { gag_note "Claude Code $_s settings: none ($_f)"; continue; }
+    json_tool >/dev/null || continue
+    gag_json status "$_f"; _rc=$?
+    case $_rc in
+      0) gag_ok "Claude Code $_s: attribution off" ;;
+      2) _fail "Claude Code $_s settings is not a JSON object: $_f" ;;
+      *) gag_warn "Claude Code $_s: attribution not off (attribution install$( [ "$_s" = local ] && printf ' --local'))" ;;
+    esac
+  done
+
+  if [ "$_bad" = 0 ]; then gag_ok "no problems found"; else return 1; fi
+}
+
+# ------------------------------------------------------------------ main ---
+
+main() {
+  [ $# -gt 0 ] || { usage; exit 0; }
+  _cmd=$1; shift
+  case ${1:-} in -h|--help) cmd_help "$_cmd"; exit 0 ;; esac
+  case $_cmd in
+    install) cmd_install "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    status) cmd_status "$@" ;;
+    on) cmd_onoff true "$@" ;;
+    off) cmd_onoff false "$@" ;;
+    mode) cmd_mode "$@" ;;
+    allow) cmd_allow "$@" ;;
+    author) cmd_author "$@" ;;
+    check) cmd_check "$@" ;;
+    rewrite) cmd_rewrite "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    hook) [ $# -ge 1 ] || gag_die "hook: missing hook name"; _h=$1; shift; gag_hook_main "$_h" 0 "$@" ;;
+    version|--version|-V) printf 'attribution %s\n' "$GAG_VERSION" ;;
+    help|-h|--help) cmd_help "${1:-}" ;;
+    *) gag_err "unknown command '$_cmd'"; usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"
