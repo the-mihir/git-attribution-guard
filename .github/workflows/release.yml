@@ -47,6 +47,10 @@ jobs:
           ' CHANGELOG.md > dist/NOTES.md
           {
             echo
+            sed "s/__VERSION__/$v/g" docs/QUICKSTART.md
+            echo
+            echo "Full documentation: [README](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/README.md)"
+            echo
             echo "### Verify the download"
             echo '```sh'
             echo "sha256sum --check --ignore-missing SHA256SUMS   # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS"

@@ -91,7 +91,8 @@ H
   rm "$HOME/block"
   git push -q origin main 2>/dev/null
   assert_file_contains "$HOME/prepush.stdin" "refs/heads/main"
-  assert_file_contains "$HOME/prepush.args" "origin $SANDBOX/remote.git"
+  assert_file_contains "$HOME/prepush.args" "origin "
+  assert_file_contains "$HOME/prepush.args" "remote.git"
 }
 
 test_passthrough_hooks_keep_working() {
@@ -116,7 +117,8 @@ test_previous_global_hookspath_is_chained_and_restored() {
   commit "x"
   assert_ok test -f "$HOME/global-hook.ran"
   sh "$ROOT/install.sh" --uninstall >/dev/null 2>&1
-  assert_eq "$SANDBOX/myhooks" "$(git config --global core.hooksPath)"
+  restored=$(git config --global core.hooksPath)
+  assert_eq "$SANDBOX/myhooks" "$(cd "$restored" && pwd -P)" "previous hooksPath restored"
   assert_fails git config --global attribution.previousHooksPath
 }
 

@@ -655,7 +655,7 @@ cmd_author() {
   done
   case $_sub in
     set)
-      [ -n "$_n" ] && [ -n "$_e" ] || gag_die 'usage: attribution author set "<Name>" <email>'
+      if [ -z "$_n" ] || [ -z "$_e" ]; then gag_die 'usage: attribution author set "<Name>" <email>'; fi
       case $_e in *@*) ;; *) gag_die "author: '$_e' is not an email" ;; esac
       cfg_set attribution.authorName "$_n"; cfg_set attribution.authorEmail "$_e"
       gag_ok "expected author = $_n <$_e> ($SCOPE)"
